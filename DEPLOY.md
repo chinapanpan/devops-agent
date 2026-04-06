@@ -8,33 +8,17 @@ Set the following variables before running the deployment commands:
 export AWS_ACCOUNT_ID="<YOUR_AWS_ACCOUNT_ID>"      # e.g., 123456789012
 export AWS_REGION="<YOUR_AWS_REGION>"               # e.g., us-west-2
 export EC2_INSTANCE_ID="<YOUR_EC2_INSTANCE_ID>"     # e.g., i-0abc123def456
+export DEVOPS_AGENT_SPACE_ID="<YOUR_AGENT_SPACE_ID>" # e.g., f95eb69d-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 export FEISHU_APP_ID="<YOUR_FEISHU_APP_ID>"         # e.g., cli_xxxxxxxxxxxx
 export FEISHU_APP_SECRET="<YOUR_FEISHU_APP_SECRET>"
 export FEISHU_CHAT_ID="<YOUR_FEISHU_CHAT_ID>"       # e.g., oc_xxxxxxxxxxxx
 ```
 
-> **Note**: To get the `FEISHU_CHAT_ID`, you can use the Feishu API to list chats the bot is in, or create a new group chat. See [Step 3](#step-3-configure-feishu-bot).
+> **Prerequisites**: You must have an AWS DevOps Agent Space already created and associated with your AWS account. See [AWS DevOps Agent documentation](https://docs.aws.amazon.com/devopsagent/latest/userguide/) for setup instructions.
 
 ---
 
-## Step 1: Create IAM Roles
-
-### 1.1 AIOps Investigation Role
-
-This role allows CloudWatch Investigations to access your resources during investigations.
-
-```bash
-aws iam create-role \
-  --role-name CloudWatchInvestigationsRole \
-  --assume-role-policy-document file://iam/aiops-role-trust.json \
-  --description "Role for CloudWatch AIOps Investigations"
-
-aws iam attach-role-policy \
-  --role-name CloudWatchInvestigationsRole \
-  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
-```
-
-### 1.2 Lambda Execution Role
+## Step 1: Create IAM Role for Lambda
 
 ```bash
 aws iam create-role \
@@ -45,47 +29,51 @@ aws iam create-role \
 aws iam attach-role-policy \
   --role-name DevOpsAgentDemoLambdaRole \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-```
 
-Wait 10 seconds for IAM role propagation:
-```bash
-sleep 10
+# Add DevOps Agent permissions
+aws iam put-role-policy \
+  --role-name DevOpsAgentDemoLambdaRole \
+  --policy-name DevOpsAgentAccess \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "aidevops:CreateBacklogTask",
+          "aidevops:ListJournalRecords",
+          "aidevops:GetTask",
+          "aidevops:ListTasks"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }'
+
+sleep 10  # Wait for IAM role propagation
 ```
 
 ---
 
-## Step 2: Create AIOps Investigation Group
+## Step 2: Create Lambda Layer (Latest boto3)
+
+The Lambda runtime's built-in boto3 does NOT include the `devops-agent` service. You must create a Lambda Layer with the latest boto3.
 
 ```bash
-# Create the investigation group
-aws aiops create-investigation-group \
-  --name "devops-agent-demo" \
-  --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/CloudWatchInvestigationsRole" \
-  --retention-in-days 90 \
-  --is-cloud-trail-event-history-enabled \
-  --region ${AWS_REGION}
-```
+mkdir -p /tmp/boto3-layer/python
+pip install boto3 -t /tmp/boto3-layer/python --upgrade
+cd /tmp/boto3-layer && zip -r /tmp/boto3-layer.zip python/
+cd -
 
-Save the ARN from the output, then set the resource policy to allow CloudWatch alarms to create investigations:
-
-```bash
-# Get the investigation group ARN
-INVESTIGATION_GROUP_ARN=$(aws aiops list-investigation-groups \
+LAYER_ARN=$(aws lambda publish-layer-version \
+  --layer-name boto3-latest \
+  --description "Latest boto3 with DevOps Agent support" \
+  --zip-file fileb:///tmp/boto3-layer.zip \
+  --compatible-runtimes python3.12 \
   --region ${AWS_REGION} \
-  --query 'investigationGroups[?name==`devops-agent-demo`].arn' \
-  --output text)
+  --query 'LayerVersionArn' --output text)
 
-echo "Investigation Group ARN: ${INVESTIGATION_GROUP_ARN}"
-
-# Create resource policy (replace placeholders in the template)
-POLICY=$(cat iam/investigation-group-policy.json \
-  | sed "s/\${AWS_ACCOUNT_ID}/${AWS_ACCOUNT_ID}/g" \
-  | sed "s/\${AWS_REGION}/${AWS_REGION}/g")
-
-aws aiops put-investigation-group-policy \
-  --identifier "${INVESTIGATION_GROUP_ARN}" \
-  --policy "${POLICY}" \
-  --region ${AWS_REGION}
+echo "Lambda Layer ARN: ${LAYER_ARN}"
 ```
 
 ---
@@ -101,8 +89,6 @@ aws aiops put-investigation-group-policy \
 
 ### 3.2 Get Chat ID
 
-If you don't have a chat ID yet, you can create a group or list existing chats:
-
 ```bash
 # Get token
 TOKEN=$(curl -s -X POST 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal' \
@@ -113,34 +99,45 @@ TOKEN=$(curl -s -X POST 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_
 # List chats the bot is in
 curl -s 'https://open.feishu.cn/open-apis/im/v1/chats' \
   -H "Authorization: Bearer ${TOKEN}" | python3 -m json.tool
-
-# Or create a new group
-curl -s -X POST 'https://open.feishu.cn/open-apis/im/v1/chats' \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"DevOps Agent Alerts","chat_type":"private"}' | python3 -m json.tool
 ```
-
-Set the `FEISHU_CHAT_ID` from the output.
 
 ---
 
-## Step 4: Deploy Lambda Function
+## Step 4: Deploy Lambda Functions
+
+### 4.1 Lambda-A (Trigger Investigation)
 
 ```bash
-# Package the Lambda function
-cd lambda && zip -j function.zip lambda_function.py && cd ..
+cd lambda && zip -j lambda_a.zip lambda_a.py && cd ..
 
-# Create the function
 aws lambda create-function \
-  --function-name devops-agent-feishu-notifier \
+  --function-name devops-agent-trigger-investigation \
   --runtime python3.12 \
-  --handler lambda_function.lambda_handler \
+  --handler lambda_a.lambda_handler \
   --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/DevOpsAgentDemoLambdaRole" \
-  --zip-file fileb://lambda/function.zip \
+  --zip-file fileb://lambda/lambda_a.zip \
   --timeout 30 \
   --memory-size 128 \
-  --environment "Variables={FEISHU_APP_ID=${FEISHU_APP_ID},FEISHU_APP_SECRET=${FEISHU_APP_SECRET},FEISHU_CHAT_ID=${FEISHU_CHAT_ID}}" \
+  --layers "${LAYER_ARN}" \
+  --environment "Variables={DEVOPS_AGENT_SPACE_ID=${DEVOPS_AGENT_SPACE_ID}}" \
+  --region ${AWS_REGION}
+```
+
+### 4.2 Lambda-B (Get Results + Feishu Notification)
+
+```bash
+cd lambda && zip -j lambda_b.zip lambda_b.py && cd ..
+
+aws lambda create-function \
+  --function-name devops-agent-notify-feishu \
+  --runtime python3.12 \
+  --handler lambda_b.lambda_handler \
+  --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/DevOpsAgentDemoLambdaRole" \
+  --zip-file fileb://lambda/lambda_b.zip \
+  --timeout 60 \
+  --memory-size 128 \
+  --layers "${LAYER_ARN}" \
+  --environment "Variables={DEVOPS_AGENT_SPACE_ID=${DEVOPS_AGENT_SPACE_ID},FEISHU_APP_ID=${FEISHU_APP_ID},FEISHU_APP_SECRET=${FEISHU_APP_SECRET},FEISHU_CHAT_ID=${FEISHU_CHAT_ID}}" \
   --region ${AWS_REGION}
 ```
 
@@ -149,38 +146,32 @@ aws lambda create-function \
 ## Step 5: Create CloudWatch Alarm
 
 ```bash
-# Get investigation group ARN (if not already set)
-INVESTIGATION_GROUP_ARN=$(aws aiops list-investigation-groups \
-  --region ${AWS_REGION} \
-  --query 'investigationGroups[?name==`devops-agent-demo`].arn' \
-  --output text)
-
-# Create the alarm
 aws cloudwatch put-metric-alarm \
   --alarm-name "DevOps-Agent-Demo-CPU-High" \
-  --alarm-description "Triggers AIOps investigation when CPU > 80%" \
+  --alarm-description "Triggers DevOps Agent investigation when CPU > 80%" \
   --metric-name CPUUtilization \
   --namespace AWS/EC2 \
   --statistic Average \
   --period 60 \
   --threshold 80 \
   --comparison-operator GreaterThanThreshold \
-  --evaluation-periods 1 \
+  --evaluation-periods 2 \
   --dimensions "Name=InstanceId,Value=${EC2_INSTANCE_ID}" \
-  --alarm-actions "${INVESTIGATION_GROUP_ARN}" \
-  --treat-missing-data notBreaching \
+  --treat-missing-data missing \
   --region ${AWS_REGION}
 ```
 
 ---
 
-## Step 6: Create EventBridge Rule
+## Step 6: Create EventBridge Rules
+
+### 6.1 Rule-1: CloudWatch Alarm -> Lambda-A
 
 ```bash
-# Create rule to match alarm state changes
+# Create rule
 aws events put-rule \
   --name "DevOps-Agent-Demo-Alarm-To-Lambda" \
-  --description "Forward CloudWatch alarm state changes to Lambda" \
+  --description "Forward CloudWatch alarm state changes to Lambda-A" \
   --event-pattern "{
     \"source\": [\"aws.cloudwatch\"],
     \"detail-type\": [\"CloudWatch Alarm State Change\"],
@@ -191,19 +182,49 @@ aws events put-rule \
   --state ENABLED \
   --region ${AWS_REGION}
 
-# Grant EventBridge permission to invoke Lambda
+# Grant EventBridge permission to invoke Lambda-A
 aws lambda add-permission \
-  --function-name devops-agent-feishu-notifier \
-  --statement-id EventBridgeInvoke \
+  --function-name devops-agent-trigger-investigation \
+  --statement-id EventBridgeAlarmInvoke \
   --action lambda:InvokeFunction \
   --principal events.amazonaws.com \
   --source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/DevOps-Agent-Demo-Alarm-To-Lambda" \
   --region ${AWS_REGION}
 
-# Add Lambda as target
+# Add Lambda-A as target
 aws events put-targets \
   --rule "DevOps-Agent-Demo-Alarm-To-Lambda" \
-  --targets "Id=feishu-notifier,Arn=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:devops-agent-feishu-notifier" \
+  --targets "Id=trigger-investigation,Arn=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:devops-agent-trigger-investigation" \
+  --region ${AWS_REGION}
+```
+
+### 6.2 Rule-2: Investigation Completed -> Lambda-B
+
+```bash
+# Create rule
+aws events put-rule \
+  --name "DevOps-Agent-Investigation-Completed" \
+  --description "Forward DevOps Agent Investigation Completed events to Lambda-B" \
+  --event-pattern "{
+    \"source\": [\"aws.aidevops\"],
+    \"detail-type\": [\"Investigation Completed\"]
+  }" \
+  --state ENABLED \
+  --region ${AWS_REGION}
+
+# Grant EventBridge permission to invoke Lambda-B
+aws lambda add-permission \
+  --function-name devops-agent-notify-feishu \
+  --statement-id EventBridgeInvestigationInvoke \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/DevOps-Agent-Investigation-Completed" \
+  --region ${AWS_REGION}
+
+# Add Lambda-B as target
+aws events put-targets \
+  --rule "DevOps-Agent-Investigation-Completed" \
+  --targets "Id=notify-feishu,Arn=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:devops-agent-notify-feishu" \
   --region ${AWS_REGION}
 ```
 
@@ -238,41 +259,47 @@ stress --cpu 4 --timeout 180
      --query 'MetricAlarms[0].StateValue'
    ```
 
-2. Check Lambda logs:
+2. Check Lambda-A logs (should show `create_backlog_task` response):
    ```bash
-   aws logs tail "/aws/lambda/devops-agent-feishu-notifier" \
-     --region ${AWS_REGION} --since 5m
+   aws logs tail "/aws/lambda/devops-agent-trigger-investigation" \
+     --region ${AWS_REGION} --since 10m
    ```
 
-3. Check Feishu group chat for the notification
+3. Wait for investigation to complete (typically 5-10 minutes), then check Lambda-B logs:
+   ```bash
+   aws logs tail "/aws/lambda/devops-agent-notify-feishu" \
+     --region ${AWS_REGION} --since 30m
+   ```
 
-4. Check AIOps investigations in CloudWatch console:
-   `https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#investigations`
+4. Check Feishu group chat for the investigation summary notification
+
+5. Check DevOps Agent console:
+   `https://${AWS_REGION}.console.aws.amazon.com/aidevops/home?region=${AWS_REGION}`
 
 ---
 
 ## Cleanup
 
 ```bash
-# Delete EventBridge target and rule
-aws events remove-targets --rule "DevOps-Agent-Demo-Alarm-To-Lambda" --ids "feishu-notifier" --region ${AWS_REGION}
+# Delete EventBridge targets and rules
+aws events remove-targets --rule "DevOps-Agent-Demo-Alarm-To-Lambda" --ids "trigger-investigation" --region ${AWS_REGION}
 aws events delete-rule --name "DevOps-Agent-Demo-Alarm-To-Lambda" --region ${AWS_REGION}
 
-# Delete Lambda
-aws lambda delete-function --function-name devops-agent-feishu-notifier --region ${AWS_REGION}
+aws events remove-targets --rule "DevOps-Agent-Investigation-Completed" --ids "notify-feishu" --region ${AWS_REGION}
+aws events delete-rule --name "DevOps-Agent-Investigation-Completed" --region ${AWS_REGION}
+
+# Delete Lambda functions
+aws lambda delete-function --function-name devops-agent-trigger-investigation --region ${AWS_REGION}
+aws lambda delete-function --function-name devops-agent-notify-feishu --region ${AWS_REGION}
+
+# Delete Lambda Layer
+aws lambda delete-layer-version --layer-name boto3-latest --version-number 1 --region ${AWS_REGION}
 
 # Delete CloudWatch alarm
 aws cloudwatch delete-alarms --alarm-names "DevOps-Agent-Demo-CPU-High" --region ${AWS_REGION}
 
-# Delete AIOps investigation group
-INVESTIGATION_GROUP_ARN=$(aws aiops list-investigation-groups --region ${AWS_REGION} --query 'investigationGroups[?name==`devops-agent-demo`].arn' --output text)
-aws aiops delete-investigation-group --identifier "${INVESTIGATION_GROUP_ARN}" --region ${AWS_REGION}
-
-# Delete IAM roles
-aws iam detach-role-policy --role-name CloudWatchInvestigationsRole --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
-aws iam detach-role-policy --role-name CloudWatchInvestigationsRole --policy-arn arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
-aws iam delete-role --role-name CloudWatchInvestigationsRole
-
+# Delete IAM role
+aws iam delete-role-policy --role-name DevOpsAgentDemoLambdaRole --policy-name DevOpsAgentAccess
 aws iam detach-role-policy --role-name DevOpsAgentDemoLambdaRole --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 aws iam delete-role --role-name DevOpsAgentDemoLambdaRole
 ```
