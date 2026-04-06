@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "aiops.alarms.cloudwatch.amazonaws.com"
+      },
+      "Action": [
+        "aiops:CreateInvestigation",
+        "aiops:CreateInvestigationEvent"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "${AWS_ACCOUNT_ID}"
+        },
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:cloudwatch:${AWS_REGION}:${AWS_ACCOUNT_ID}:alarm:*"
+        }
+      }
+    }
+  ]
+}
